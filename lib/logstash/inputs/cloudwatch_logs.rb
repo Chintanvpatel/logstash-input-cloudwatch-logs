@@ -31,6 +31,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # Should be a path with filename not just a directory.
   config :sincedb_path, :validate => :string, :default => nil
 
+  config :tokendb_path, :validate => :string, :default => nil
+
   # Interval to wait between to check the file list again after a run is finished.
   # Value is in seconds.
   config :interval, :validate => :number, :default => 60
@@ -38,6 +40,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def register
   public
   def register
+  	@logger.info(@tokendb_path)
     require "digest/md5"
     require "aws-sdk"
 
@@ -51,9 +54,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def run
   public
   def run(queue)
-    while !stop?
+    Stud.interval(@interval) do
       process_group(queue)
-      Stud.stoppable_sleep(@interval)
     end
   end # def run
 
@@ -74,10 +76,10 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     objects.push(*streams.log_streams)
     if streams.next_token == nil
-      @logger.debug("CloudWatch Logs hit end of tokens for streams")
+      @logger.info("CloudWatch Logs hit end of tokens for streams")
       objects
     else
-      @logger.debug("CloudWatch Logs calling list_new_streams again on token", :token => streams.next_token)
+      @logger.info("CloudWatch Logs calling list_new_streams again on token", :token => streams.next_token)
       list_new_streams(streams.next_token, objects)
     end
 
@@ -111,6 +113,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     objects = list_new_streams
 
     last_read = sincedb.read
+    last_token = sincedb.read_token
     current_window = DateTime.now.strftime('%Q')
 
     if last_read < 0
@@ -119,7 +122,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     objects.each do |stream|
       if stream.last_ingestion_time && stream.last_ingestion_time > last_read
-        process_log_stream(queue, stream, last_read, current_window)
+        process_log_stream(queue, stream, last_read, current_window, last_token)
       end
     end
 
@@ -129,14 +132,6 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def process_log_stream
   private
   def process_log_stream(queue, stream, last_read, current_window, token = nil)
-    @logger.debug("CloudWatch Logs processing stream",
-                  :log_stream => stream.log_stream_name,
-                  :log_group => @log_group,
-                  :lastRead => last_read,
-                  :currentWindow => current_window,
-                  :token => token
-    )
-
     params = {
         :log_group_name => @log_group,
         :log_stream_name => stream.log_stream_name,
@@ -146,6 +141,14 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     if token != nil
       params[:next_token] = token
     end
+    
+    @logger.info("CloudWatch Logs processing stream",
+                  :log_stream => stream.log_stream_name,
+                  :log_group => @log_group,
+                  :lastRead => last_read,
+                  :currentWindow => current_window,
+                  :token => token
+    )
 
     logs = @cloudwatch.get_log_events(params)
 
@@ -157,6 +160,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     # if there are more pages, continue
     if logs.events.count != 0 && logs.next_forward_token != nil
+      sincedb.writetoken(logs.next_forward_token)
       process_log_stream(queue, stream, last_read, current_window, logs.next_forward_token)
     end
   end # def process_log_stream
@@ -165,11 +169,11 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   def sincedb
     @sincedb ||= if @sincedb_path.nil?
                    @logger.info("Using default generated file for the sincedb", :filename => sincedb_file)
-                   SinceDB::File.new(sincedb_file)
+                   SinceDB::File.new(sincedb_file, tokendb_file)
                  else
                    @logger.info("Using the provided sincedb_path",
                                 :sincedb_path => @sincedb_path)
-                   SinceDB::File.new(@sincedb_path)
+                   SinceDB::File.new(@sincedb_path, @tokendb_path)
                  end
   end
 
@@ -178,10 +182,16 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     File.join(ENV["HOME"], ".sincedb_" + Digest::MD5.hexdigest("#{@log_group}"))
   end
 
+  private
+  def tokendb_file
+    File.join(ENV["HOME"], ".tokendb_" + Digest::MD5.hexdigest("#{@log_group}"))
+  end
+
   module SinceDB
     class File
-      def initialize(file)
+      def initialize(file, tokenfile)
         @sincedb_path = file
+        @tokendb_path = tokenfile
       end
 
       def newer?(date)
@@ -197,9 +207,22 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         return since
       end
 
+      def read_token
+        if ::File.exists?(@tokendb_path)
+          since = ::File.read(@tokendb_path).chomp.strip
+        else
+          since = nil
+        end
+        return since
+      end
+
       def write(since = nil)
         since = DateTime.now.strftime('%Q') if since.nil?
         ::File.open(@sincedb_path, 'w') { |file| file.write(since.to_s) }
+      end
+
+      def writetoken(token = nil)
+        ::File.open(@tokendb_path, 'w') { |file| file.write(token) }
       end
     end
   end
