@@ -138,7 +138,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         :start_from_head => true
     }
 
-    if token != nil
+    if token != nil && token != ''
       params[:next_token] = token
     end
     
